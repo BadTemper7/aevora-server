@@ -84,7 +84,7 @@ const reactionSchema = new Schema({ userId: str, emoji: { ...str, maxlength: 64 
 const messageSchema = new Schema({
   conversationId: { type: Schema.Types.ObjectId, ref: "SocialConversation", required: true },
   senderId: str, clientId: String,
-  kind: { type: String, enum: ["text", "image", "video", "gif", "file", "sticker"], default: "text" },
+  kind: { type: String, enum: ["text", "image", "video", "gif", "file", "mixed", "sticker"], default: "text" },
   text: { type: String, maxlength: 5000, default: "" },
   mediaIds: { type: [Schema.Types.ObjectId], default: [] },
   gif: { type: new Schema({ id: String, url: String, previewUrl: String, source: String }, { _id: false }), default: undefined },

@@ -17,6 +17,7 @@ import { ensureMediaFolders, maxImageBytes, maxVideoBytes, mediaDirs, mediaPath,
 import { streamPrivateObject, signedPrivateDownload, storageMode } from '../storage/imagekit.js';
 import { env } from '../config/env.js';
 import { scanUploadedFile } from './scan.js';
+import { isDynamicImageThumbnail } from './thumbnailPolicy.js';
 
 const router = Router();
 const extensions = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif", "image/avif": "avif", "video/mp4": "mp4", "video/webm": "webm", "video/quicktime": "mov", "application/pdf": "pdf", "text/plain": "txt" };
@@ -160,9 +161,10 @@ router.get("/media/:id/file", async (req, res, next) => {
     if (!media || media.status !== "ready") throw new AppError("Media is not ready.", 404);
     if (!await authorizeMedia(req, media)) throw new AppError("You are not allowed to view this media.", 403);
     const thumbnail = req.query.thumb === "1";
-    if (thumbnail && !media.thumbKey && !media.thumbObjectKey) throw new AppError('Thumbnail is not available.', 404);
-    const key = thumbnail ? media.thumbKey : media.optimizedKey;
-    if (!key) throw new AppError("Media file is not available.", 404);
+    const dynamicThumbnail = thumbnail && isDynamicImageThumbnail(media);
+    if (thumbnail && !media.thumbKey && !media.thumbObjectKey && !dynamicThumbnail) throw new AppError('Thumbnail is not available.', 404);
+    const key = thumbnail && !dynamicThumbnail ? media.thumbKey : media.optimizedKey;
+    if (!key && !media.objectKey) throw new AppError("Media file is not available.", 404);
     const mime = thumbnail ? 'image/webp' : media.mime;
     res.setHeader('Content-Type', mime);
     res.setHeader('Cache-Control', 'private, max-age=300');
@@ -174,12 +176,12 @@ router.get("/media/:id/file", async (req, res, next) => {
     }
     res.setHeader('Accept-Ranges', 'bytes');
     if (['imagekit', 'cloudflare-r2'].includes(media.storageProvider) && media.objectKey) {
-      const objectKey = thumbnail ? media.thumbObjectKey : media.objectKey;
+      const objectKey = thumbnail ? (media.thumbObjectKey || (dynamicThumbnail ? media.objectKey : null)) : media.objectKey;
       if (!objectKey) throw new AppError('Media thumbnail not found.', 404);
       const range = !thumbnail && mime.startsWith('video/') ? req.headers.range : null;
       if (range && !/^bytes=\d*-\d*$/.test(range)) { res.status(416).end(); return; }
       const stream = media.storageProvider === 'imagekit'
-        ? await streamPrivateObject(objectKey, range)
+        ? await streamPrivateObject(objectKey, range, dynamicThumbnail)
         : await (await import('../storage/r2.js')).streamPrivateObject(objectKey, range);
       // Upstream may ignore Range; never falsely report 206 without an upstream Content-Range.
       if (stream.ContentRange) { res.status(206); res.setHeader('Content-Range', stream.ContentRange); }
@@ -211,9 +213,10 @@ router.get('/media/:id/signed-url', wrap(async (req) => {
   if (!await authorizeMedia(req, media)) throw new AppError('Not authorized.', 403);
   if (!['imagekit', 'cloudflare-r2'].includes(media.storageProvider)) throw new AppError('Only cloud media supports signed URLs.', 409);
   const thumb = req.query.thumb === '1';
-  const key = thumb ? media.thumbObjectKey : media.objectKey;
+  const dynamicThumbnail = thumb && isDynamicImageThumbnail(media);
+  const key = thumb ? (media.thumbObjectKey || (dynamicThumbnail ? media.objectKey : null)) : media.objectKey;
   if (!key) throw new AppError('Media variant is missing.', 404);
-  return { url: media.storageProvider === 'imagekit' ? await signedPrivateDownload(key, 60) : await (await import('../storage/r2.js')).signedPrivateDownload(key, 60), expiresIn: 60 };
+  return { url: media.storageProvider === 'imagekit' ? await signedPrivateDownload(key, 60, dynamicThumbnail) : await (await import('../storage/r2.js')).signedPrivateDownload(key, 60), expiresIn: 60 };
 }));
 router.get('/media/storage/me', wrap(async (req) => {
   const rows = await Media.aggregate([

@@ -11,6 +11,19 @@ import { conversationMatchesTab } from "./conversationFilters.js";
 import { conversationUnreadPipeline } from "./unreadSummary.js";
 
 const router = Router();
+/** Resolve every attachment once per page. This metadata is display-only; downloads
+ * still go through the existing owner/conversation authorization route. */
+async function hydrateMessageAttachments(rows) {
+  if (!rows.length || rows.every((row) => Array.isArray(row.attachments))) return rows;
+  const ids = [...new Set(rows.flatMap((row) => (row.mediaIds || []).map(String)))];
+  if (!ids.length) return rows.map((row) => ({ ...row, attachments: [] }));
+  const media = await Media.find({ _id: { $in: ids }, status: 'ready' })
+    .select('_id originalName kind mime size').lean();
+  const byId = new Map(media.map((asset) => [String(asset._id), {
+    id: String(asset._id), name: asset.originalName, kind: asset.kind, mime: asset.mime, size: asset.size,
+  }]));
+  return rows.map((row) => ({ ...row, attachments: (row.mediaIds || []).map((id) => byId.get(String(id))).filter(Boolean) }));
+}
 async function messagesForViewer(items, conversation, viewer) {
   const blockedIds = new Set();
   const permittedRead = new Set([viewer]);
@@ -18,10 +31,11 @@ async function messagesForViewer(items, conversation, viewer) {
     if (await blocked(viewer, m.userId)) blockedIds.add(m.userId);
     else if (await audienceAllows(viewer, m.userId, (await privacyFor(m.userId)).readReceiptsVisibility || "friends")) permittedRead.add(m.userId);
   }
-  return items.filter((m) => !blockedIds.has(m.senderId) && !(m.hiddenFor || []).includes(viewer) && (!m.expiresAt || new Date(m.expiresAt) > new Date())).map((m) => {
+  const visible = items.filter((m) => !blockedIds.has(m.senderId) && !(m.hiddenFor || []).includes(viewer) && (!m.expiresAt || new Date(m.expiresAt) > new Date())).map((m) => {
     const raw = m.toObject?.() || m;
     return { ...raw, readBy: (raw.readBy || []).filter((x) => permittedRead.has(x)) };
   });
+  return hydrateMessageAttachments(visible);
 }
 // Newly-created messages need only the sender's own read receipt. Batch block
 // checks once rather than querying each member's privacy settings N times.
@@ -266,12 +280,11 @@ router.get("/conversations/:id/attachments", wrap(async (req) => {
   const kind = type === "files" ? ["file"] : ["image", "gif", "video"];
   const query = { conversationId: c._id, deletedAt: null, hiddenFor: { $ne: req.user.id }, $or: [{ expiresAt: null }, { expiresAt: { $gt: new Date() } }] };
   if (type === "links") query.text = { $regex: "https?://", $options: "i" };
-  else query.kind = { $in: kind };
+  else query.kind = { $in: [...kind, "mixed"] };
   const rows = await messagesForViewer(await Message.find(query).sort({ createdAt: -1 }).limit(100).lean(), c, req.user.id);
-  const ids = rows.flatMap((msg) => msg.mediaIds || []);
-  const assets = ids.length ? await Media.find({ _id: { $in: ids }, status: "ready" }).select("_id originalName kind mime").lean() : [];
-  const byId = new Map(assets.map((asset) => [String(asset._id), { id: String(asset._id), name: asset.originalName, kind: asset.kind, mime: asset.mime }]));
-  return rows.map((msg) => ({ ...msg, attachments: msg.mediaIds?.map((id) => byId.get(String(id))).filter(Boolean) || [] }));
+  if (type === "links") return rows;
+  return rows.map((msg) => ({ ...msg, attachments: (msg.attachments || []).filter((asset) => kind.includes(asset.kind)) }))
+    .filter((msg) => msg.attachments.length > 0);
 }));
 router.get("/conversations/:id/search", wrap(async (req) => {
   const c = await loadConversation(req);
@@ -286,7 +299,7 @@ router.post("/conversations/:id/messages", messageSendLimiter, wrap(async (req) 
   // Only the GIPHY content ID is stored. Browser clients resolve the image
   // directly with GIPHY, so media URLs are never cached in MongoDB.
   const gifSchema = z.object({ source: z.literal("giphy"), id: z.string().regex(/^[A-Za-z0-9_-]{1,90}$/) }).strict();
-  const data = body(req, z.object({ text: z.string().max(5000).optional(), mediaIds: z.array(z.string()).max(4).default([]), kind: z.enum(["text", "image", "video", "gif", "file"]).default("text"), gif: gifSchema.optional(), replyTo: z.string().optional(), clientId: z.string().uuid() }).strict());
+  const data = body(req, z.object({ text: z.string().max(5000).optional(), mediaIds: z.array(z.string()).max(4).default([]), kind: z.enum(["text", "image", "video", "gif", "file", "mixed"]).default("text"), gif: gifSchema.optional(), replyTo: z.string().optional(), clientId: z.string().uuid() }).strict());
   const text = cleanText(data.text || "", 5000);
   if (!text && !data.mediaIds.length && !data.gif) throw new AppError("Message cannot be empty.", 400);
   if (data.gif && (data.kind !== "gif" || data.mediaIds.length)) throw new AppError("Invalid GIF message.", 400);
@@ -294,7 +307,10 @@ router.post("/conversations/:id/messages", messageSendLimiter, wrap(async (req) 
     const ids = data.mediaIds.map(objectId);
     const assets = await Media.find({ _id: { $in: ids }, ownerId: req.user.id, status: "ready", purpose: "message" }).lean();
     if (assets.length !== ids.length) throw new AppError("An attachment is missing or still processing.", 409);
-    if (assets.some((asset) => asset.kind !== data.kind)) throw new AppError("Attachment type does not match message type.", 400);
+    const expectedKinds = new Set(assets.map((asset) => asset.kind));
+    const expectedKind = expectedKinds.size > 1 ? "mixed" : [...expectedKinds][0];
+    if (expectedKind !== data.kind) throw new AppError("Attachment type does not match message type.", 400);
+    if (new Set(data.mediaIds).size !== data.mediaIds.length) throw new AppError("Duplicate attachment ID.", 400);
   }
   let replyTo;
   if (data.replyTo) {
@@ -311,12 +327,13 @@ router.post("/conversations/:id/messages", messageSendLimiter, wrap(async (req) 
   }
   // Emit as soon as the Message document is durable. Do not wait for a second
   // database write to update the conversation preview before delivery.
-  void emitNewMessage(c, msg).catch((error) => console.error("Message broadcast failed", { messageId: msg.id, error: error.message }));
+  const storedMessage = (await hydrateMessageAttachments([msg.toObject()]))[0];
+  void emitNewMessage(c, storedMessage).catch((error) => console.error("Message broadcast failed", { messageId: msg.id, error: error.message }));
   // Atomic preview guard prevents rapid concurrent sends from replacing a newer preview.
   await Conversation.updateOne({ _id: c._id, $or: [{ lastMessageAt: { $lte: msg.createdAt } }, { lastMessageAt: null }] }, { $set: { lastMessageAt: msg.createdAt, lastPreview: text.slice(0, 120) || (data.kind === "video" ? "Video" : data.kind === "gif" ? "GIF" : data.kind === "file" ? "File" : "Attachment") } });
   emitConversation(c, "conversation:updated", { id: c.id });
   // Ordinary messages belong to conversation unread tracking, never the bell.
-  return msg;
+  return storedMessage;
 }));
 router.post("/conversations/:id/read", wrap(async (req) => {
   const c = await loadConversation(req); const now = new Date();

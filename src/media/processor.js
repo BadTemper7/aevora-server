@@ -9,6 +9,7 @@ import { Media, Message, Profile, Video, SocialPost, SocialStory, GifFavorite, C
 import { Community, ChannelMessage } from '../communities/models.js';
 import { storageMode, putPrivateObject, deletePrivateObject, objectPrefix } from '../storage/imagekit.js';
 import { maxImageWidth, percentageSaved, preferOriginal, storageMime, videoMaxHeight } from './policy.js';
+import { needsStoredThumbnail } from './thumbnailPolicy.js';
 
 export const mediaRoot = path.resolve(process.env.MEDIA_ROOT || path.join(process.cwd(), 'storage'));
 export const mediaDirs = Object.fromEntries(['temp', 'originals', 'processed', 'thumbs'].map((name) => [name, path.join(mediaRoot, name)]));
@@ -108,8 +109,12 @@ async function processOne(item) {
         effective = input;
         details = { width: info.width, height: info.height };
       }
-      await sharp(input, { animated: false, limitInputPixels: 60_000_000 }).rotate().resize({ width: 320, height: 320, fit: 'inside', withoutEnlargement: true }).webp({ quality: 68 }).toFile(thumbnail);
-      producedThumb = true;
+      // ImageKit can resize the signed, optimized image at delivery time.
+      // Do not upload a second permanent image merely for its thumbnail.
+      if (needsStoredThumbnail(item.kind, storageMode)) {
+        await sharp(input, { animated: false, limitInputPixels: 60_000_000 }).rotate().resize({ width: 320, height: 320, fit: 'inside', withoutEnlargement: true }).webp({ quality: 68 }).toFile(thumbnail);
+        producedThumb = true;
+      }
     }
     const keepOriginal = effective === input;
     mime = storageMime(item.kind, item.originalMime, keepOriginal);
@@ -121,11 +126,13 @@ async function processOne(item) {
     if (storageMode === 'imagekit') {
       // Same owner and purpose only: never reveal or reuse someone else's private object.
       const duplicate = await Media.findOne({ _id: { $ne: item._id }, ownerId: item.ownerId, purpose: item.purpose, checksum, status: 'ready', storageProvider: 'imagekit', storageFileId: { $exists: true } }).lean();
-      if (duplicate && duplicate.mime === mime && Boolean(duplicate.thumbObjectKey) === Boolean(producedThumb)) {
+      if (duplicate && duplicate.mime === mime && (!producedThumb || Boolean(duplicate.thumbObjectKey))) {
+        // Reuse an existing main image even when older uploads have separate thumbnails.
+        // A new image record needs no reference to that old physical thumbnail.
         objectKey = duplicate.objectKey;
-        thumbObjectKey = duplicate.thumbObjectKey || null;
+        thumbObjectKey = producedThumb ? duplicate.thumbObjectKey : null;
         fileId = duplicate.storageFileId;
-        thumbFileId = duplicate.thumbStorageFileId || null;
+        thumbFileId = producedThumb ? duplicate.thumbStorageFileId : null;
       } else {
         const prefix = objectPrefix({ kind: item.kind, purpose: item.purpose, ownerId: item.ownerId, entityId: String(item._id) });
         const ext = mime === 'video/mp4' ? 'mp4' : mime === 'image/webp' ? 'webp' : mime === 'image/jpeg' ? 'jpg' : mime === 'image/png' ? 'png' : mime === 'image/gif' ? 'gif' : mime === 'application/pdf' ? 'pdf' : mime === 'text/plain' ? 'txt' : 'bin';

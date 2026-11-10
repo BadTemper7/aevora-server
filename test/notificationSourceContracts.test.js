@@ -3,7 +3,7 @@ const code=p=>readFileSync(new URL(p,import.meta.url),'utf8');
 test('send, reply, reaction and group request endpoints never write ordinary bell notifications',()=>{
  const src=code('../src/social/messageRoutes.js');
  assert.doesNotMatch(src,/notify\(/);
- assert.match(src,/emitNewMessage\(c, msg\)/);
+ assert.match(src,/emitNewMessage\(c, storedMessage\)/);
  assert.match(src,/router\.post\("\/conversations\/:id\/read"/);
 });
 test('notification APIs paginate with a cursor and expose independent unread counts',()=>{

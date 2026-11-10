@@ -17,7 +17,7 @@ test("server does not mark online recipients delivered without an acknowledgemen
 test("persistence precedes realtime emit without creating chat notifications", () => {
   assert.match(routes, /Message\.create\(/);
   assert.match(routes, /Conversation\.updateOne\(/);
-  assert.match(routes, /void emitNewMessage\(c, msg\)/);
+  assert.match(routes, /void emitNewMessage\(c, storedMessage\)/);
   assert.doesNotMatch(routes, /notify\(/);
 });
 test("advanced message actions have authorization and persistent fields", () => {
