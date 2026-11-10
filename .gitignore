@@ -1,0 +1,9 @@
+node_modules/
+.env
+.env.*
+!.env.example
+!.env.imagekit.example
+storage/
+*.log
+media-migration-*.json
+media-imagekit-migration-*.json
