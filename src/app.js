@@ -25,6 +25,7 @@ import channelRoutes from "./communities/channelRoutes.js";
 import communityMediaRoutes from "./communities/mediaRoutes.js";
 import communityEventRoutes from "./communities/eventRoutes.js";
 import { livekitWebhook } from "./communities/mediaService.js";
+import { mountProductionClient } from "./productionClient.js";
 
 export function createApp(auth) {
   const app = express();
@@ -63,6 +64,8 @@ export function createApp(auth) {
     }
     next();
   }, authenticate, socialRateLimiter, communityRoutes, channelRoutes, communityMediaRoutes, communityEventRoutes);
+  // In production, React and the API share one HTTPS origin.
+  mountProductionClient(app);
   app.use(notFound);
   app.use(errorHandler);
   return app;
