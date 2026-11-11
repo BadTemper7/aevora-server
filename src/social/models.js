@@ -84,7 +84,7 @@ const reactionSchema = new Schema({ userId: str, emoji: { ...str, maxlength: 64 
 const messageSchema = new Schema({
   conversationId: { type: Schema.Types.ObjectId, ref: "SocialConversation", required: true },
   senderId: str, clientId: String,
-  kind: { type: String, enum: ["text", "image", "video", "gif", "file", "mixed", "sticker"], default: "text" },
+  kind: { type: String, enum: ["text", "image", "video", "gif", "file", "audio", "mixed", "sticker"], default: "text" },
   text: { type: String, maxlength: 5000, default: "" },
   mediaIds: { type: [Schema.Types.ObjectId], default: [] },
   gif: { type: new Schema({ id: String, url: String, previewUrl: String, source: String }, { _id: false }), default: undefined },
@@ -137,7 +137,7 @@ commentSchema.index({ videoId: 1, createdAt: -1 });
 export const VideoComment = models.SocialVideoComment || model("SocialVideoComment", commentSchema);
 
 const mediaSchema = new Schema({
-  ownerId: str, originalName: String, originalMime: String, mime: String, kind: { type: String, enum: ["image", "video", "gif", "file"], required: true },
+  ownerId: str, originalName: String, originalMime: String, mime: String, kind: { type: String, enum: ["image", "video", "gif", "file", "audio"], required: true },
   status: { type: String, enum: ["pending", "processing", "ready", "failed"], default: "pending" },
   originalKey: str, optimizedKey: String, thumbKey: String, size: Number, width: Number, height: Number,
   storageProvider: { type: String, enum: ['local','cloudflare-r2','imagekit'], default: 'local' },
@@ -145,7 +145,7 @@ const mediaSchema = new Schema({
   originalSize: Number, receivedSize: Number, optimizedSize: Number, thumbSize: Number, compressionRatio: Number,
   checksum: String, sourceChecksum: String, duration: Number, contentEtag: String, migratedAt: Date,
   error: String, startedAt: Date, completedAt: Date, progress: { type: Number, default: 0 }, attempts: { type: Number, default: 0 },
-  purpose: { type: String, enum: ["message", "video", "avatar", "cover", "post", "story", "community"], required: true },
+  purpose: { type: String, enum: ["message", "video", "avatar", "cover", "post", "story", "community", "story_audio"], required: true },
   variant: { type: String, enum: ["icon", "banner", null], default: null },
   uploadedAt: { type: Date, default: Date.now },
 }, opts("social_media"));
@@ -229,14 +229,51 @@ export const SocialPostComment = models.SocialPostComment || model("SocialPostCo
 
 const storySchema = new Schema({
   ownerId: str,
-  mediaId: { type: Schema.Types.ObjectId, ref: "SocialMedia", required: true },
-  mediaKind: { type: String, enum: ["image", "gif", "video"], default: "image" },
+  mediaId: { type: Schema.Types.ObjectId, ref: "SocialMedia", default: null },
+  mediaKind: { type: String, enum: ["image", "gif", "video", "text"], default: "image" },
   visibility: { type: String, enum: ["public", "friends", "followers"], default: "public" },
+  duration: { type: Number, min: 3, max: 60, default: 10 },
+  effects: { type: Schema.Types.Mixed, default: {} },
+  layers: { type: [Schema.Types.Mixed], default: [] },
+  music: { type: Schema.Types.Mixed, default: null },
+  promptSource: { type: Schema.Types.Mixed, default: null },
+  groupId: { type: String, index: true },
+  slideIndex: { type: Number, default: 0 },
   expiresAt: { type: Date, required: true },
 }, opts("social_stories"));
 storySchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 storySchema.index({ ownerId: 1, createdAt: -1 });
+storySchema.index({ groupId: 1, slideIndex: 1 });
 export const SocialStory = models.SocialStory || model("SocialStory", storySchema);
+
+const storyMusicSchema = new Schema({
+  ownerId: str,
+  mediaId: { type: Schema.Types.ObjectId, ref: 'SocialMedia', required: true },
+  title: { ...str, maxlength: 120 }, artist: { ...str, maxlength: 120 },
+  genre: { type: String, default: 'Other', maxlength: 50 }, mood: { type: String, default: 'Other', maxlength: 50 },
+  visibility: { type: String, enum: ['public', 'private'], default: 'private' },
+  rightsType: { type: String, enum: ['original', 'licensed'], required: true },
+  rightsConfirmed: { type: Boolean, required: true },
+  duration: Number, coverId: { type: Schema.Types.ObjectId, ref: 'SocialMedia', default: null }, uses: { type: Number, default: 0 },
+}, opts('social_story_music'));
+storyMusicSchema.index({ visibility: 1, uses: -1, createdAt: -1 });
+storyMusicSchema.index({ ownerId: 1, createdAt: -1 });
+storyMusicSchema.index({ mediaId: 1 }, { unique: true });
+export const StoryMusic = models.StoryMusic || model('StoryMusic', storyMusicSchema);
+
+const storyMusicFavoriteSchema = new Schema({ userId: str, trackId: { type: Schema.Types.ObjectId, ref: 'StoryMusic', required: true }, recentlyUsedAt: Date, favorite: { type: Boolean, default: false } }, opts('social_story_music_favorites'));
+storyMusicFavoriteSchema.index({ userId: 1, trackId: 1 }, { unique: true });
+export const StoryMusicFavorite = models.StoryMusicFavorite || model('StoryMusicFavorite', storyMusicFavoriteSchema);
+
+const storyStickerResponseSchema = new Schema({
+  storyId: { type: Schema.Types.ObjectId, ref: 'SocialStory', required: true }, stickerId: { ...str, maxlength: 64 },
+  userId: str, type: { type: String, enum: ['poll','question','slider','countdown'], required: true },
+  option: Number, answer: String, value: Number, remind: Boolean, reminderSentAt: Date, expiresAt: Date,
+}, opts('social_story_sticker_responses'));
+storyStickerResponseSchema.index({ storyId: 1, stickerId: 1, userId: 1 }, { unique: true });
+storyStickerResponseSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+storyStickerResponseSchema.index({ type: 1, remind: 1, reminderSentAt: 1 });
+export const StoryStickerResponse = models.StoryStickerResponse || model('StoryStickerResponse', storyStickerResponseSchema);
 
 const storyViewSchema = new Schema({
   storyId: { type: Schema.Types.ObjectId, ref: "SocialStory", required: true },

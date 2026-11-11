@@ -5,7 +5,7 @@ import { mkdir, readdir, rename, rm, stat, copyFile } from 'node:fs/promises';
 import path from 'node:path';
 import sharp from 'sharp';
 import { env } from '../config/env.js';
-import { Media, Message, Profile, Video, SocialPost, SocialStory, GifFavorite, Conversation } from '../social/models.js';
+import { Media, Message, Profile, Video, SocialPost, SocialStory, StoryMusic, GifFavorite, Conversation } from '../social/models.js';
 import { Community, ChannelMessage } from '../communities/models.js';
 import { storageMode, putPrivateObject, deletePrivateObject, objectPrefix } from '../storage/imagekit.js';
 import { maxImageWidth, percentageSaved, preferOriginal, storageMime, videoMaxHeight } from './policy.js';
@@ -45,7 +45,7 @@ async function sha256File(filename) {
 }
 async function processOne(item) {
   const input = mediaPath('originals', item.originalKey);
-  const processed = mediaPath('processed', `${item._id}.${item.kind === 'video' ? 'mp4' : item.kind === 'file' ? 'bin' : 'webp'}`);
+  const processed = mediaPath('processed', `${item._id}.${item.kind === 'video' ? 'mp4' : item.kind === 'audio' ? 'm4a' : item.kind === 'file' ? 'bin' : 'webp'}`);
   const thumbnail = mediaPath('thumbs', `${item._id}.webp`);
   let effective = processed, mime = item.originalMime, details = {}, duration = 0;
   let producedMain = false, producedThumb = false;
@@ -66,14 +66,28 @@ async function processOne(item) {
     if (item.kind === 'file') {
       // PDFs, signed PDFs and UTF-8 text remain byte-for-byte intact. Recompress only with a signature-safe opt-in tool.
       effective = input;
+    } else if (item.kind === 'audio') {
+      const info = await probe(input);
+      duration = Number(info.format?.duration || 0);
+      if (!duration || duration > Number(process.env.MAX_STORY_TRACK_DURATION_SEC || 600)) throw new Error('Audio track has an invalid duration.');
+      await ffmpeg(['-i', input, '-vn', '-c:a', 'aac', '-b:a', '96k', '-ar', '44100', '-movflags', '+faststart', processed]);
+      producedMain = true;
+      // A compatible, already-small M4A source may be retained; never enlarge without benefit.
+      if (['audio/mp4','audio/x-m4a'].includes(item.originalMime) && inputSize <= (await stat(processed)).size) effective = input;
+      await Media.updateOne({ _id: item._id }, { $set: { progress: 82 } });
     } else if (item.kind === 'video') {
       const info = await probe(input);
       duration = Number(info.format?.duration || 0);
       if (!duration || duration > env.MAX_MEDIA_DURATION_SEC) throw new Error('Video duration is invalid or exceeds the allowed limit.');
+      const sourceDuration = duration;
+      const clipStart = item.purpose === 'story' ? Number(item.clipStart || 0) : 0;
+      const clipEnd = item.purpose === 'story' && Number(item.clipEnd || 0) > 0 ? Number(item.clipEnd) : sourceDuration;
+      if (clipStart >= sourceDuration || clipEnd > sourceDuration + 0.1 || clipEnd <= clipStart) throw new Error('Invalid story video clip.');
+      duration = Math.min(sourceDuration, clipEnd) - clipStart;
       const maxHeight = videoMaxHeight();
       const outputHeight = maxHeight;
       let lastProgress = 10;
-      await ffmpeg(['-i',input,'-map','0:v:0','-map','0:a?','-vf',`scale=-2:'min(${outputHeight},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2`, '-c:v','libx264','-preset',process.env.VIDEO_PRESET || 'medium','-crf',String(Number(process.env.VIDEO_CRF || 27)),'-pix_fmt','yuv420p','-c:a','aac','-b:a','112k','-movflags','+faststart',processed], seconds => {
+      await ffmpeg([...(clipStart ? ['-ss',String(clipStart)] : []),'-i',input,...(item.purpose === 'story' && (clipStart || item.clipEnd) ? ['-t',String(duration)] : []),'-map','0:v:0','-map','0:a?','-vf',`scale=-2:'min(${outputHeight},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2`, '-c:v','libx264','-preset',process.env.VIDEO_PRESET || 'medium','-crf',String(Number(process.env.VIDEO_CRF || 27)),'-pix_fmt','yuv420p','-c:a','aac','-b:a','112k','-movflags','+faststart',processed], seconds => {
         const next = Math.min(82, Math.floor(10 + seconds / duration * 72));
         if (next > lastProgress + 5) { lastProgress = next; Media.updateOne({ _id: item._id }, { $set: { progress: next } }).catch(console.error); }
       });
@@ -82,7 +96,7 @@ async function processOne(item) {
       const video = streams.find(x => x.codec_type === 'video');
       const audio = streams.find(x => x.codec_type === 'audio');
       // Keep an already-small compatible MP4 when transcoding would increase storage.
-      if (item.originalMime === 'video/mp4' && video?.codec_name === 'h264' && (!audio || audio.codec_name === 'aac') && Number(video.height) <= maxHeight && inputSize <= (await stat(processed)).size) {
+      if (!clipStart && !item.clipEnd && item.originalMime === 'video/mp4' && video?.codec_name === 'h264' && (!audio || audio.codec_name === 'aac') && Number(video.height) <= maxHeight && inputSize <= (await stat(processed)).size) {
         // Remux efficiently encoded originals without losing quality; still move the MP4 moov atom up front.
         const remux = `${processed}.remux.mp4`;
         try {
@@ -93,7 +107,7 @@ async function processOne(item) {
       }
       const png = `${thumbnail}.png`;
       try {
-        await ffmpeg(['-ss','0.3','-i',input,'-frames:v','1','-vf','scale=480:-2','-c:v','png',png]);
+        await ffmpeg(['-ss',String(Math.min(sourceDuration - 0.1, clipStart + 0.3)),'-i',input,'-frames:v','1','-vf','scale=480:-2','-c:v','png',png]);
         await sharp(png).webp({ quality: 70 }).toFile(thumbnail);
       } finally { await rm(png, { force: true }); }
       producedThumb = true;
@@ -135,7 +149,7 @@ async function processOne(item) {
         thumbFileId = producedThumb ? duplicate.thumbStorageFileId : null;
       } else {
         const prefix = objectPrefix({ kind: item.kind, purpose: item.purpose, ownerId: item.ownerId, entityId: String(item._id) });
-        const ext = mime === 'video/mp4' ? 'mp4' : mime === 'image/webp' ? 'webp' : mime === 'image/jpeg' ? 'jpg' : mime === 'image/png' ? 'png' : mime === 'image/gif' ? 'gif' : mime === 'application/pdf' ? 'pdf' : mime === 'text/plain' ? 'txt' : 'bin';
+        const ext = mime === 'video/mp4' ? 'mp4' : mime === 'audio/mp4' ? 'm4a' : mime === 'image/webp' ? 'webp' : mime === 'image/jpeg' ? 'jpg' : mime === 'image/png' ? 'png' : mime === 'image/gif' ? 'gif' : mime === 'application/pdf' ? 'pdf' : mime === 'text/plain' ? 'txt' : 'bin';
         const uploaded = await putPrivateObject({ objectKey: `${prefix}/${checksum}-${randomUUID()}.${ext}`, filename: effective, mime });
         objectKey = uploaded.objectKey;
         fileId = uploaded.fileId;
@@ -246,11 +260,12 @@ export async function cleanupMedia() {
   for (const media of abandoned) {
     const [message, video, profile, post, story, community, channelMessage, conversation, favorite] = await Promise.all([
       Message.exists({ mediaIds: media._id }), Video.exists({ mediaId: media._id }), Profile.exists({ $or: [{ avatarId: String(media._id) }, { coverId: String(media._id) }] }),
-      SocialPost.exists({ mediaIds: media._id }), SocialStory.exists({ mediaId: media._id, expiresAt: { $gt: new Date() } }),
+      SocialPost.exists({ mediaIds: media._id }), SocialStory.exists({ $or: [{ mediaId: media._id }, { 'layers.mediaId': String(media._id) }], expiresAt: { $gt: new Date() } }),
       Community.exists({ $or: [{ iconId: String(media._id) }, { bannerId: String(media._id) }] }), ChannelMessage.exists({ mediaIds: media._id }),
       Conversation.exists({ avatarId: String(media._id) }), GifFavorite.exists({ mediaId: media._id }),
     ]);
-    if ([message, video, profile, post, story, community, channelMessage, conversation, favorite].some(Boolean)) continue;
+    const storyTrack = await StoryMusic.exists({ $or: [{ mediaId: media._id }, { coverId: media._id }] });
+    if ([message, video, profile, post, story, storyTrack, community, channelMessage, conversation, favorite].some(Boolean)) continue;
     // Preserve records if any deletion or API call is still using the media reference.
     // If ImageKit deletion fails, retain the metadata so a later cleanup can retry.
     await removeMediaStorage(media);

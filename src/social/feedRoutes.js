@@ -3,9 +3,9 @@ import { z } from "zod";
 import { AppError } from "../utils/AppError.js";
 import {
   EventJob, Follow, Media, SocialPost, SocialPostComment,
-  SocialPostInteraction, SocialStory, SocialStoryView,
+  SocialPostInteraction,
 } from "./models.js";
-import { canSeePost, canSeeStory } from "./feedRules.js";
+import { canSeePost } from "./feedRules.js";
 import { cleanText, limitValue, objectId, usersByIds } from "./helpers.js";
 import { body, wrap } from "./routeUtils.js";
 import { notify } from "./notify.js";
@@ -135,34 +135,6 @@ router.post("/feed/posts/:id/comments", wrap(async (req) => {
   await SocialPost.updateOne({ _id: post._id }, { $inc: { commentsCount: 1 } });
   if (post.ownerId !== req.user.id) await notify({ to: post.ownerId, from: req.user.id, type: "comment", entityId: post.id, title: `${req.user.username} commented on your post`, dedupeKey: `post-comment:${item.id}` });
   return { id: item.id, text: item.text, createdAt: item.createdAt };
-}));
-
-router.get("/stories", wrap(async (req) => {
-  const rows = await SocialStory.find({ expiresAt: { $gt: new Date() } }).sort({ _id: -1 }).limit(120).lean();
-  const allowed = [];
-  for (const story of rows) if (await canSeeStory(req.user.id, story)) allowed.push(story);
-  const users = await usersByIds(allowed.map((s) => s.ownerId));
-  const seen = await SocialStoryView.find({ viewerId: req.user.id, storyId: { $in: allowed.map((s) => s._id) } }).select("storyId").lean();
-  const viewed = new Set(seen.map((v) => String(v.storyId)));
-  return allowed.map((s) => ({ id: String(s._id), ownerId: s.ownerId, author: users.get(s.ownerId) || { name: "Account" }, mediaId: String(s.mediaId), mediaKind: s.mediaKind || "image", seen: s.ownerId === req.user.id || viewed.has(String(s._id)), createdAt: s.createdAt, expiresAt: s.expiresAt }));
-}));
-router.post("/stories", wrap(async (req) => {
-  const input = body(req, z.object({ mediaId: z.string(), visibility: z.enum(["public", "friends", "followers"]).default("public") }).strict());
-  const [mediaId] = await validateMedia([input.mediaId], req.user.id, "story", ["image", "gif", "video"]);
-  const media = await Media.findById(mediaId).lean();
-  const story = await SocialStory.create({ ownerId: req.user.id, mediaId, mediaKind: media.kind, visibility: input.visibility, expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000) });
-  return { id: story.id, mediaId: String(story.mediaId), expiresAt: story.expiresAt };
-}));
-router.post("/stories/:id/view", wrap(async (req) => {
-  const story = await SocialStory.findById(objectId(req.params.id)).lean();
-  if (!story || !await canSeeStory(req.user.id, story)) throw new AppError("Story not found.", 404);
-  await SocialStoryView.updateOne({ storyId: story._id, viewerId: req.user.id }, { $setOnInsert: { storyId: story._id, viewerId: req.user.id, expiresAt: story.expiresAt } }, { upsert: true });
-  return { seen: true };
-}));
-router.delete("/stories/:id", wrap(async (req) => {
-  const result = await SocialStory.deleteOne({ _id: objectId(req.params.id), ownerId: req.user.id });
-  if (!result.deletedCount) throw new AppError("Story not found or not yours.", 404);
-  return { deleted: true };
 }));
 
 export default router;

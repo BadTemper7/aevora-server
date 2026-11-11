@@ -13,6 +13,7 @@ export const IMPORTANT_NOTIFICATION_TYPES = Object.freeze([
   'community_access_changed',
   'community_moderation_action',
   'community_event_reminder',
+  'story_countdown_reminder',
   'account_security',
   'account_alert',
   'moderation_action',

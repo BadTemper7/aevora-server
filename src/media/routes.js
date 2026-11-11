@@ -7,7 +7,7 @@ import multer from "multer";
 import { fileTypeFromFile } from "file-type";
 import { AppError } from "../utils/AppError.js";
 import { canSeeVideo, objectId, privacyFor, audienceAllows, blocked } from "../social/helpers.js";
-import { Conversation, Media, Message, Profile, Video, SocialPost, SocialStory } from "../social/models.js";
+import { Conversation, Media, Message, Profile, Video, SocialPost, SocialStory, StoryMusic } from "../social/models.js";
 import { canSeePost, canSeeStory } from "../social/feedRules.js";
 import { Community, CommunityMember, ChannelMessage } from "../communities/models.js";
 import { channelContext } from "../communities/permissions.js";
@@ -20,7 +20,7 @@ import { scanUploadedFile } from './scan.js';
 import { isDynamicImageThumbnail } from './thumbnailPolicy.js';
 
 const router = Router();
-const extensions = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif", "image/avif": "avif", "video/mp4": "mp4", "video/webm": "webm", "video/quicktime": "mov", "application/pdf": "pdf", "text/plain": "txt" };
+const extensions = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif", "image/avif": "avif", "video/mp4": "mp4", "video/webm": "webm", "video/quicktime": "mov", "application/pdf": "pdf", "text/plain": "txt", "audio/mpeg": "mp3", "audio/mp4": "m4a", "audio/x-m4a": "m4a", "audio/wav": "wav", "audio/x-wav": "wav", "audio/vnd.wave": "wav", "audio/wave": "wav", "audio/ogg": "ogg", "audio/aac": "aac" };
 const maxDocumentBytes = Math.min(25, Math.max(1, Number(process.env.MAX_DOCUMENT_MB || 12))) * 1024 * 1024;
 const uploader = multer({ storage: multer.diskStorage({ destination: (_req, _file, done) => done(null, mediaDirs.temp), filename: (_req, _file, done) => done(null, randomUUID()) }), limits: { files: 1, fileSize: maxVideoBytes }, fileFilter: (_req, file, done) => {
   if (file.originalname.length > 255) return done(new AppError("File name is too long.", 400));
@@ -47,7 +47,7 @@ router.post("/media", uploadRateLimiter, async (req, res, next) => {
   if (!file) throw new AppError("Select a file to upload.", 400);
   const purpose = req.body?.purpose;
   try {
-    if (!["message", "video", "avatar", "cover", "post", "story", "community"].includes(purpose)) throw new AppError("Invalid upload purpose.", 400);
+    if (!["message", "video", "avatar", "cover", "post", "story", "community", "story_audio"].includes(purpose)) throw new AppError("Invalid upload purpose.", 400);
     const type = await fileTypeFromFile(file.path);
     let actual = type?.mime;
     if (!actual && /\.txt$/i.test(file.originalname) && file.size <= maxDocumentBytes) {
@@ -56,11 +56,13 @@ router.post("/media", uploadRateLimiter, async (req, res, next) => {
       try { new TextDecoder("utf-8", { fatal: true }).decode(bytes); if (bytes.includes(0)) throw new Error("Binary content"); actual = "text/plain"; }
       catch { throw new AppError("This text file is not valid UTF-8 plain text.", 415); }
     }
-    if (!actual || !extensions[actual]) throw new AppError("Unsupported file content. Use images, video, GIF, PDF, or UTF-8 TXT.", 415);
-    const kind = ["application/pdf", "text/plain"].includes(actual) ? "file" : actual === "image/gif" ? "gif" : actual.startsWith("video/") ? "video" : "image";
+    if (!actual || !extensions[actual]) throw new AppError("Unsupported file content. Use images, video, GIF, audio, PDF, or UTF-8 TXT.", 415);
+    const kind = ["application/pdf", "text/plain"].includes(actual) ? "file" : actual === "image/gif" ? "gif" : actual.startsWith("video/") ? "video" : actual.startsWith("audio/") ? "audio" : "image";
+    if (purpose === "story_audio" && kind !== "audio") throw new AppError("Music tracks must be audio files.", 400);
+    if (kind === "audio" && (purpose !== "story_audio" || file.size > 15 * 1024 * 1024)) throw new AppError("Music tracks must be under 15 MB.", 413);
     if (kind === "file" && (!["message", "community"].includes(purpose) || file.size > maxDocumentBytes)) throw new AppError("Documents are limited to chat uploads up to 12 MB.", 413);
     if (purpose === "video" && kind !== "video" || ["avatar", "cover", "post"].includes(purpose) && kind === "video") throw new AppError("File type does not match its intended use.", 400);
-    if (file.size > (kind === "video" ? maxVideoBytes : kind === "file" ? maxDocumentBytes : maxImageBytes)) throw new AppError("File exceeds the configured size limit.", 413);
+    if (file.size > (kind === "video" ? maxVideoBytes : kind === "file" ? maxDocumentBytes : kind === "audio" ? 15 * 1024 * 1024 : maxImageBytes)) throw new AppError("File exceeds the configured size limit.", 413);
     // ImageKit permanent files are never uploaded before validation and optimization.
     const activeBytes = await Media.aggregate([
       { $match: { ownerId: req.user.id, status: { $in: ['ready','pending','processing'] } } },
@@ -74,9 +76,12 @@ router.post("/media", uploadRateLimiter, async (req, res, next) => {
     await rename(file.path, mediaPath('originals', key));
     try {
       const variant = purpose === 'community' && ['icon','banner'].includes(req.body?.variant) ? req.body.variant : null;
+      const clipStart = purpose === 'story' && kind === 'video' ? Number(req.body?.clipStart || 0) : 0;
+      const clipEnd = purpose === 'story' && kind === 'video' ? Number(req.body?.clipEnd || 0) : 0;
+      if (![clipStart, clipEnd].every(Number.isFinite) || clipStart < 0 || clipEnd < 0 || clipStart > 3600 || clipEnd > 3600 || (clipEnd && clipEnd <= clipStart)) throw new AppError('Invalid video trim times.', 400);
       const reportedSize = Math.max(file.size, Math.min(maxVideoBytes, Number(req.body?.sourceOriginalSize) || file.size));
       const item = await Media.create({ ownerId: req.user.id, originalName: path.basename(String(req.body?.originalName || file.originalname)).slice(0, 255), originalMime: actual, kind,
-        originalKey: key, status: 'pending', progress: 0, purpose, size: file.size, receivedSize: file.size, originalSize: reportedSize,
+        originalKey: key, clipStart, clipEnd, status: 'pending', progress: 0, purpose, size: file.size, receivedSize: file.size, originalSize: reportedSize,
         storageProvider: storageMode === 'imagekit' ? 'imagekit' : 'local', variant });
       return { id: item.id, status: item.status, kind: item.kind, originalName: item.originalName };
     } catch (error) { await rm(mediaPath('originals', key), { force: true }); throw error; }
@@ -141,8 +146,18 @@ async function authorizeMedia(req, media) {
     for (const post of posts) if (await canSeePost(req.user.id, post)) return true;
     return false;
   }
+  if (media.purpose === 'story_audio') {
+    const catalog = await StoryMusic.findOne({ mediaId: media._id }).lean();
+    if (!catalog) return false;
+    if (catalog.visibility === 'public') return true;
+    const stories = await SocialStory.find({ 'music.trackId': catalog?._id?.toString(), expiresAt: { $gt: new Date() } }).limit(100).lean();
+    for (const story of stories) if (await canSeeStory(req.user.id, story)) return true;
+    return false;
+  }
   if (media.purpose === "story") {
-    const stories = await SocialStory.find({ mediaId: media._id, expiresAt: { $gt: new Date() } }).lean();
+    const cover = await StoryMusic.findOne({ coverId: media._id }).lean();
+    if (cover?.visibility === 'public') return true;
+    const stories = await SocialStory.find({ $or: [{ mediaId: media._id }, { 'layers.mediaId': String(media._id) }], expiresAt: { $gt: new Date() } }).lean();
     for (const story of stories) if (await canSeeStory(req.user.id, story)) return true;
     return false;
   }
@@ -178,7 +193,7 @@ router.get("/media/:id/file", async (req, res, next) => {
     if (['imagekit', 'cloudflare-r2'].includes(media.storageProvider) && media.objectKey) {
       const objectKey = thumbnail ? (media.thumbObjectKey || (dynamicThumbnail ? media.objectKey : null)) : media.objectKey;
       if (!objectKey) throw new AppError('Media thumbnail not found.', 404);
-      const range = !thumbnail && mime.startsWith('video/') ? req.headers.range : null;
+      const range = !thumbnail && (mime.startsWith('video/') || mime.startsWith('audio/')) ? req.headers.range : null;
       if (range && !/^bytes=\d*-\d*$/.test(range)) { res.status(416).end(); return; }
       const stream = media.storageProvider === 'imagekit'
         ? await streamPrivateObject(objectKey, range, dynamicThumbnail)
@@ -195,7 +210,7 @@ router.get("/media/:id/file", async (req, res, next) => {
       // Transparent fallback for existing local media and development mode.
       const filename = mediaPath(thumbnail ? 'thumbs' : 'processed', key);
       const { size } = await stat(filename);
-      if (req.headers.range && !thumbnail && mime.startsWith('video/')) {
+      if (req.headers.range && !thumbnail && (mime.startsWith('video/') || mime.startsWith('audio/'))) {
         const match = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range);
         if (!match) { res.status(416).end(); return; }
         const start = match[1] ? Number(match[1]) : Math.max(0, size - Number(match[2] || 0));
@@ -230,7 +245,7 @@ router.delete("/media/:id", wrap(async (req) => {
   const id = objectId(req.params.id);
   const item = await Media.findOne({ _id: id, ownerId: req.user.id });
   if (!item) throw new AppError("Media not found.", 404);
-  const attached = await Promise.all([Message.exists({ mediaIds: id }), Video.exists({ mediaId: id }), SocialPost.exists({ mediaIds: id }), SocialStory.exists({ mediaId: id }), Profile.exists({ $or: [{ avatarId: String(id) }, { coverId: String(id) }] }), ChannelMessage.exists({ mediaIds: id }), Community.exists({ $or: [{ iconId: String(id) }, { bannerId: String(id) }] })]);
+  const attached = await Promise.all([Message.exists({ mediaIds: id }), Video.exists({ mediaId: id }), SocialPost.exists({ mediaIds: id }), SocialStory.exists({ $or: [{ mediaId: id }, { 'layers.mediaId': String(id) }] }), StoryMusic.exists({ $or: [{ mediaId: id }, { coverId: id }] }), Profile.exists({ $or: [{ avatarId: String(id) }, { coverId: String(id) }] }), ChannelMessage.exists({ mediaIds: id }), Community.exists({ $or: [{ iconId: String(id) }, { bannerId: String(id) }] })]);
   if (attached.some(Boolean)) throw new AppError("This media is in use.", 409);
   if (item.status === 'processing' || item.status === 'pending') throw new AppError('Please wait until processing finishes before deleting this upload.', 409);
   await removeMediaStorage(item);

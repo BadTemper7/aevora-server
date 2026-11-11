@@ -16,6 +16,7 @@ import notificationRoutes from "./social/notificationRoutes.js";
 import moderationRoutes from "./social/moderationRoutes.js";
 import mediaRoutes from "./media/routes.js";
 import feedRoutes from "./social/feedRoutes.js";
+import storyRoutes from "./social/storyRoutes.js";
 import gifRoutes from "./social/gifRoutes.js";
 import { socialRateLimiter } from "./social/rateLimit.js";
 import { authenticate } from "./middleware/authenticate.js";
@@ -39,6 +40,9 @@ export function createApp(auth) {
     try { await livekitWebhook(req.body, req.get("Authorization")); res.sendStatus(200); }
     catch (error) { console.warn("LiveKit webhook rejected:", error.message); res.sendStatus(401); }
   });
+  // Story batches contain validated slide metadata and up to 240 sticker layers.
+  // Parse only this API subtree at a higher limit; keep general API JSON small.
+  app.use('/api/social/stories', express.json({ limit: '256kb' }));
   app.use(express.json({ limit: "16kb" }));
   app.get("/api/health", (_req, res) => res.json({ success: true, data: { status: "ok" } }));
   app.use("/api", accountRoutes);
@@ -51,7 +55,7 @@ export function createApp(auth) {
     }
     next();
   });
-  app.use("/api/social", authenticate, socialRateLimiter, peopleRoutes, messageRoutes, gifRoutes, videoRoutes, notificationRoutes, moderationRoutes, feedRoutes, mediaRoutes);
+  app.use("/api/social", authenticate, socialRateLimiter, peopleRoutes, messageRoutes, gifRoutes, videoRoutes, notificationRoutes, moderationRoutes, feedRoutes, storyRoutes, mediaRoutes);
   app.use("/api", (req, _res, next) => {
     // CSRF hardening for community and voice mutations, consistent with social APIs.
     if (["POST", "PUT", "PATCH", "DELETE"].includes(req.method) && req.headers.origin && req.headers.origin !== new URL(env.CLIENT_URL).origin) {

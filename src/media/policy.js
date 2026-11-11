@@ -7,4 +7,4 @@ export function preferOriginal({ originalBytes, optimizedBytes, mime, width, hei
   return ['image/jpeg', 'image/png', 'image/webp', 'image/avif', 'image/gif'].includes(mime)
     && orientation === 1 && width <= maxWidth && height <= maxWidth && originalBytes <= optimizedBytes;
 }
-export const storageMime = (kind, sourceMime, keepOriginal = false) => keepOriginal ? sourceMime : kind === 'video' ? 'video/mp4' : kind === 'file' ? sourceMime : 'image/webp';
+export const storageMime = (kind, sourceMime, keepOriginal = false) => keepOriginal ? sourceMime : kind === 'video' ? 'video/mp4' : kind === 'audio' ? 'audio/mp4' : kind === 'file' ? sourceMime : 'image/webp';
